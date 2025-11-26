@@ -1,0 +1,51 @@
+# Database files
+*.db
+*.db-shm
+*.db-wal
+
+# Configuration files (may contain sensitive credentials)
+config.ini
+*.ini
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cursorrules
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment variables
+.env
+.env.local
+
+# Editor lock files
+.~lock.*
+*#
+.~*
+*.tmp
+*.bak
+*.backup
+
+# CSV exports
+*.csv

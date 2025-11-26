@@ -1,0 +1,17 @@
+🎯 API limits
+
+POST: Up to 2000 calls/min, 100 tasks per call. You pay per task.
+
+GET Tasks Ready: 20 calls/min, up to 1000 completed tasks per call, kept for 3 days.
+
+task_get endpoints. The Standard method allows sending up to 2000 API calls per minute
+
+For endpoints working with our databases, the maximum number of simultaneous requests is limited to 30. 
+
+Depth up to 700; max_crawl_pages up to 100.
+
+Must specify location and language.
+
+Extra features add extra cost.
+
+Postbacks remove tasks from Tasks Ready unless the callback fails.
