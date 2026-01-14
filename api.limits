@@ -15,3 +15,7 @@ Must specify location and language.
 Extra features add extra cost.
 
 Postbacks remove tasks from Tasks Ready unless the callback fails.
+
+Each keyword is limited to a maximum of 80 characters and 10 words. 
+
+All keywords will automatically be converted to lowercase format upon submission.

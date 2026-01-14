@@ -49,3 +49,9 @@ Thumbs.db
 
 # CSV exports
 *.csv
+
+# Local scratch
+old/
+old
+tests/
+ToDo.md

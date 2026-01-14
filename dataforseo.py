@@ -2,16 +2,26 @@
 import csv, json, os, random, sys, time, configparser, argparse
 import asyncio, aiohttp, aiosqlite
 from collections import deque
+import copy
 from datetime import datetime, timezone
 from base64 import b64encode
 import sqlite3  # only for catching OperationalError if needed
 import uuid     # for simulated sv task IDs
+from typing import Optional, Tuple
 
 # ----------------------------
 # Config / constants
 # ----------------------------
 
 DEFAULT_CONFIG_PATH = "config.ini"
+
+# Keyword validation defaults (per api.limits)
+DEFAULT_MAX_KEYWORD_CHARS = 80
+DEFAULT_MAX_KEYWORD_WORDS = 10
+DEFAULT_STORAGE_MODE = "full"
+DEFAULT_SERP_MODE = "tasks"
+
+LIVE_POST_CONCURRENCY = 10
 
 # DataForSEO rate limits (per minute)
 MAX_TASK_POST_CALLS_PER_MINUTE = 2000     # /task_post (2000 calls/min, 100 tasks/call)
@@ -148,7 +158,9 @@ async def init_db(db_path):
             language_code TEXT,
             location_name TEXT,
             se_domain TEXT,
-            device TEXT
+            device TEXT,
+            is_valid INTEGER NOT NULL DEFAULT 1,
+            invalid_reason TEXT
         )
         """
     )
@@ -206,6 +218,14 @@ async def init_db(db_path):
         await conn.execute("ALTER TABLE queries ADD COLUMN device TEXT")
     except Exception:
         pass
+    try:
+        await conn.execute("ALTER TABLE queries ADD COLUMN is_valid INTEGER DEFAULT 1")
+    except Exception:
+        pass
+    try:
+        await conn.execute("ALTER TABLE queries ADD COLUMN invalid_reason TEXT")
+    except Exception:
+        pass
 
     await conn.execute(
         """
@@ -216,6 +236,18 @@ async def init_db(db_path):
             status_message TEXT,
             result_json TEXT,
             created_at TEXT
+        )
+        """
+    )
+
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rejects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            keyword TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            source TEXT NOT NULL,
+            created_at TEXT NOT NULL
         )
         """
     )
@@ -252,6 +284,92 @@ async def init_db(db_path):
     await conn.commit()
     return conn
 
+
+def _count_words(text: str) -> int:
+    return len(text.split())
+
+
+def validate_keyword(
+    keyword: str, max_chars: Optional[int], max_words: Optional[int]
+) -> Tuple[bool, Optional[str]]:
+    if not keyword:
+        return False, "empty"
+    if max_chars and len(keyword) > max_chars:
+        return False, f"length>{max_chars}"
+    if max_words and _count_words(keyword) > max_words:
+        return False, f"words>{max_words}"
+    return True, None
+
+
+async def log_reject(conn, keyword: str, reason: str, source: str):
+    now = datetime.now(timezone.utc).isoformat()
+    await conn.execute(
+        "INSERT INTO rejects (keyword, reason, source, created_at) VALUES (?, ?, ?, ?)",
+        (keyword, reason, source, now),
+    )
+
+
+def apply_storage_mode(task_obj: dict, storage_mode: str) -> dict:
+    if storage_mode != "top10":
+        return task_obj
+
+    task_copy = copy.deepcopy(task_obj)
+    results = task_copy.get("result") or []
+    if not results:
+        return task_copy
+
+    result0 = results[0] or {}
+    items = result0.get("items") or []
+    if not items:
+        return task_copy
+
+    organic_items = []
+    for item in items:
+        if item.get("type") != "organic":
+            continue
+        rank_val = item.get("rank_absolute")
+        if rank_val is None:
+            rank_val = item.get("rank_group")
+        if rank_val is None or rank_val > 10:
+            continue
+        organic_items.append(item)
+
+    organic_items.sort(key=lambda x: x.get("rank_absolute") or x.get("rank_group") or 999999)
+    organic_items = organic_items[:10]
+
+    result0["items"] = organic_items
+    results[0] = result0
+    task_copy["result"] = results
+
+    if "result_count" in task_copy:
+        task_copy["result_count"] = len(organic_items)
+
+    return task_copy
+
+
+def build_serp_task_payload(
+    keyword: str,
+    language_code: Optional[str],
+    location_name: Optional[str],
+    location_code: Optional[int],
+    se_domain: Optional[str],
+    device: Optional[str],
+) -> dict:
+    task = {
+        "keyword": keyword,
+    }
+    if language_code:
+        task["language_code"] = language_code
+    if location_code is not None:
+        task["location_code"] = location_code
+    elif location_name:
+        task["location_name"] = location_name
+    if se_domain:
+        task["se_domain"] = se_domain
+    if device:
+        task["device"] = device
+    return task
+
 async def export_view_to_csv(conn, view_name: str, csv_path: str):
     """
     Export a database view to a CSV file.
@@ -281,6 +399,135 @@ async def export_view_to_csv(conn, view_name: str, csv_path: str):
     except Exception as e:
         print(f"[EXPORT] Error exporting '{view_name}' to '{csv_path}': {e}", file=sys.stderr)
 
+
+def _first_dict(value):
+    if isinstance(value, list) and value:
+        return value[0] if isinstance(value[0], dict) else None
+    if isinstance(value, dict):
+        return value
+    return None
+
+
+async def export_serp_items_csv(conn, csv_path: str):
+    """
+    Export flattened SERP items (including nested items) to a CSV.
+    """
+    sql = """
+        SELECT q.keyword, t.task_id, r.result_json
+        FROM results r
+        JOIN tasks t ON t.task_id = r.task_id
+        JOIN queries q ON q.id = t.query_id
+        INNER JOIN (
+            SELECT task_id, MAX(created_at) AS max_created_at
+            FROM results
+            GROUP BY task_id
+        ) latest ON latest.task_id = r.task_id AND latest.max_created_at = r.created_at
+    """
+    rows_out = []
+    async with conn.execute(sql) as cur:
+        rows = await cur.fetchall()
+        for keyword, task_id, result_json in rows:
+            if not result_json:
+                continue
+            try:
+                task_obj = json.loads(result_json)
+            except json.JSONDecodeError:
+                continue
+            results = task_obj.get("result") or []
+            if not results:
+                continue
+            items = results[0].get("items") or []
+            for item in items:
+                parent_type = item.get("type")
+                parent_rank_group = item.get("rank_group")
+                parent_rank_absolute = item.get("rank_absolute")
+                children = item.get("items")
+                if isinstance(children, list) and children:
+                    for child in children:
+                        if not isinstance(child, dict):
+                            continue
+                        expanded = None
+                        if parent_type == "people_also_ask":
+                            expanded = _first_dict(child.get("expanded_element"))
+                        row = {
+                            "keyword": keyword,
+                            "task_id": task_id,
+                            "parent_type": parent_type,
+                            "parent_rank_group": parent_rank_group,
+                            "parent_rank_absolute": parent_rank_absolute,
+                            "item_type": child.get("type"),
+                            "rank_group": child.get("rank_group"),
+                            "rank_absolute": child.get("rank_absolute"),
+                            "page": child.get("page"),
+                            "position": child.get("position"),
+                            "title": child.get("title"),
+                            "url": child.get("url"),
+                            "domain": child.get("domain"),
+                            "source": child.get("source"),
+                            "description": child.get("description"),
+                            "expanded_title": expanded.get("title") if expanded else None,
+                            "expanded_url": expanded.get("url") if expanded else None,
+                            "expanded_domain": expanded.get("domain") if expanded else None,
+                            "expanded_description": expanded.get("description") if expanded else None,
+                        }
+                        rows_out.append(row)
+                else:
+                    row = {
+                        "keyword": keyword,
+                        "task_id": task_id,
+                        "parent_type": None,
+                        "parent_rank_group": None,
+                        "parent_rank_absolute": None,
+                        "item_type": parent_type,
+                        "rank_group": item.get("rank_group"),
+                        "rank_absolute": item.get("rank_absolute"),
+                        "page": item.get("page"),
+                        "position": item.get("position"),
+                        "title": item.get("title"),
+                        "url": item.get("url"),
+                        "domain": item.get("domain"),
+                        "source": item.get("source"),
+                        "description": item.get("description"),
+                        "expanded_title": None,
+                        "expanded_url": None,
+                        "expanded_domain": None,
+                        "expanded_description": None,
+                    }
+                    rows_out.append(row)
+
+    if not rows_out:
+        print(f"[EXPORT] SERP items export is empty; skipping CSV export.")
+        return
+
+    fieldnames = [
+        "keyword",
+        "task_id",
+        "parent_type",
+        "parent_rank_group",
+        "parent_rank_absolute",
+        "item_type",
+        "rank_group",
+        "rank_absolute",
+        "page",
+        "position",
+        "title",
+        "url",
+        "domain",
+        "source",
+        "description",
+        "expanded_title",
+        "expanded_url",
+        "expanded_domain",
+        "expanded_description",
+    ]
+    try:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows_out)
+        print(f"[EXPORT] Exported {len(rows_out)} rows to '{csv_path}'")
+    except Exception as e:
+        print(f"[EXPORT] Error exporting SERP items to '{csv_path}': {e}", file=sys.stderr)
 
 async def create_views(conn):
     """
@@ -428,6 +675,19 @@ async def create_views(conn):
     ORDER BY mi.query, mi.absolute_rank;
     """)
 
+    await conn.execute("DROP VIEW IF EXISTS too_long")
+    await conn.execute("""
+    CREATE VIEW too_long AS
+    SELECT
+        keyword,
+        reason,
+        source,
+        created_at
+    FROM rejects
+    WHERE reason LIKE 'length>%' OR reason LIKE 'words>%'
+    ORDER BY created_at DESC;
+    """)
+
     await conn.commit()
     print("[DB] Views created/updated.")
 
@@ -483,7 +743,9 @@ async def import_queries_from_csv(
     conn,
     csv_path,
     simulator=False,
-    fake_count=SIMULATOR_FAKE_QUERY_COUNT,
+    allow_missing=False,
+    max_keyword_chars=DEFAULT_MAX_KEYWORD_CHARS,
+    max_keyword_words=DEFAULT_MAX_KEYWORD_WORDS,
 ):
     """
     Imports queries from CSV.
@@ -495,13 +757,13 @@ async def import_queries_from_csv(
       - se_domain                         [optional]
       - device                            [optional: desktop|mobile]
 
-    - If simulator is True and CSV is missing: continue and just top up with fake queries.
-    - If simulator is True and CSV exists: import CSV, then top up with fake queries.
-    - If simulator is False and CSV is missing: exit with error.
+    - If simulator is True and CSV is missing: continue (fake queries are handled elsewhere).
+    - If simulator is False and CSV is missing: exit with error unless allow_missing is True.
     """
     if os.path.exists(csv_path):
         print(f"[IMPORT] Loading queries from CSV: {csv_path}")
         imported = 0
+        rejected = 0
         # Use utf-8-sig to automatically strip BOM if present
         with open(csv_path, newline="", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
@@ -533,6 +795,10 @@ async def import_queries_from_csv(
                     # effectively treat this row as a comment
                     continue
 
+                valid, reason = validate_keyword(
+                    keyword, max_keyword_chars, max_keyword_words
+                )
+
                 language_code = get_field(row, "language_code", "language")
                 location_name = get_field(row, "location_name", "location")
                 se_domain = get_field(row, "se_domain", "domain")
@@ -549,14 +815,28 @@ async def import_queries_from_csv(
                     else:
                         device = d
 
+                if not valid:
+                    await log_reject(conn, keyword, reason or "invalid", "import:csv")
+
+                is_valid = 1 if valid else 0
+                invalid_reason = None if valid else reason
+
                 # Insert or update
                 await conn.execute(
                     """
                     INSERT OR IGNORE INTO queries
-                        (keyword, language_code, location_name, se_domain, device)
-                    VALUES (?, ?, ?, ?, ?)
+                        (keyword, language_code, location_name, se_domain, device, is_valid, invalid_reason)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (keyword, language_code, location_name, se_domain, device),
+                    (
+                        keyword,
+                        language_code,
+                        location_name,
+                        se_domain,
+                        device,
+                        is_valid,
+                        invalid_reason,
+                    ),
                 )
 
                 # If keyword already existed, update its metadata
@@ -567,30 +847,119 @@ async def import_queries_from_csv(
                         language_code = COALESCE(?, language_code),
                         location_name = COALESCE(?, location_name),
                         se_domain     = COALESCE(?, se_domain),
-                        device        = COALESCE(?, device)
+                        device        = COALESCE(?, device),
+                        is_valid      = ?,
+                        invalid_reason = ?
                     WHERE keyword = ?
                     """,
-                    (language_code, location_name, se_domain, device, keyword),
+                    (
+                        language_code,
+                        location_name,
+                        se_domain,
+                        device,
+                        is_valid,
+                        invalid_reason,
+                        keyword,
+                    ),
                 )
 
-                imported += 1
+                if valid:
+                    imported += 1
+                else:
+                    rejected += 1
 
         await conn.commit()
-        print(f"[IMPORT] Imported/updated {imported} queries from CSV.")
+        print(
+            f"[IMPORT] Imported/updated {imported} valid query/queries from CSV "
+            f"(rejected {rejected})."
+        )
     else:
         if simulator:
             print(
-                f"[IMPORT] CSV not found at {csv_path}; simulator mode: will generate fake queries."
+                f"[IMPORT] CSV not found at {csv_path}; simulator mode: skipping CSV."
             )
+        elif allow_missing:
+            print(f"[IMPORT] CSV not found at {csv_path}; skipping.")
         else:
             print(f"[IMPORT] CSV file not found: {csv_path}", file=sys.stderr)
             sys.exit(1)
 
-    if simulator:
-        await ensure_min_queries_for_simulator(conn, fake_count)
 
-    total = await count_queries(conn)
-    print(f"[IMPORT] Total queries in DB: {total}")
+async def import_queries_from_txt(
+    conn,
+    txt_path,
+    simulator=False,
+    allow_missing=False,
+    max_keyword_chars=DEFAULT_MAX_KEYWORD_CHARS,
+    max_keyword_words=DEFAULT_MAX_KEYWORD_WORDS,
+):
+    """
+    Imports queries from TXT (one keyword per line).
+
+    - Blank lines are ignored.
+    - Lines starting with # (after stripping whitespace) are treated as comments.
+    - No per-query metadata is supported in TXT format.
+    """
+    if os.path.exists(txt_path):
+        print(f"[IMPORT] Loading queries from TXT: {txt_path}")
+        imported = 0
+        rejected = 0
+        with open(txt_path, "r", encoding="utf-8-sig") as f:
+            for raw_line in f:
+                keyword = raw_line.strip()
+                if not keyword:
+                    continue
+                if keyword.lstrip().startswith("#"):
+                    continue
+
+                valid, reason = validate_keyword(
+                    keyword, max_keyword_chars, max_keyword_words
+                )
+                if not valid:
+                    await log_reject(conn, keyword, reason or "invalid", "import:txt")
+
+                is_valid = 1 if valid else 0
+                invalid_reason = None if valid else reason
+
+                await conn.execute(
+                    """
+                    INSERT OR IGNORE INTO queries
+                        (keyword, is_valid, invalid_reason)
+                    VALUES (?, ?, ?)
+                    """,
+                    (keyword, is_valid, invalid_reason),
+                )
+                await conn.execute(
+                    """
+                    UPDATE queries
+                    SET
+                        is_valid = ?,
+                        invalid_reason = ?
+                    WHERE keyword = ?
+                    """,
+                    (is_valid, invalid_reason, keyword),
+                )
+
+                if valid:
+                    imported += 1
+                else:
+                    rejected += 1
+
+        await conn.commit()
+        print(
+            f"[IMPORT] Imported/updated {imported} valid query/queries from TXT "
+            f"(rejected {rejected})."
+        )
+    else:
+        if simulator:
+            print(
+                f"[IMPORT] TXT not found at {txt_path}; simulator mode: skipping TXT."
+            )
+        elif allow_missing:
+            print(f"[IMPORT] TXT not found at {txt_path}; skipping.")
+        else:
+            print(f"[IMPORT] TXT file not found: {txt_path}", file=sys.stderr)
+            sys.exit(1)
 
 
 async def get_queries_without_task(conn):
@@ -605,6 +974,7 @@ async def get_queries_without_task(conn):
         FROM queries q
         LEFT JOIN tasks t ON t.query_id = q.id
         WHERE t.id IS NULL
+        AND COALESCE(q.is_valid, 1) = 1
     """
     async with conn.execute(sql) as cur:
         rows = await cur.fetchall()
@@ -624,6 +994,7 @@ async def get_queries_without_sv_task(conn):
         FROM queries q
         LEFT JOIN sv_tasks t ON t.query_id = q.id
         WHERE t.id IS NULL
+        AND COALESCE(q.is_valid, 1) = 1
     """
     async with conn.execute(sql) as cur:
         rows = await cur.fetchall()
@@ -925,7 +1296,10 @@ async def submit_tasks_for_pending_queries(
     client: RestClient,
     language_code,
     location_name,
+    location_code,
     se_domain,
+    max_keyword_chars,
+    max_keyword_words,
     task_post_rate_limiter: AsyncRateLimiter,
     job_id: int,
 ):
@@ -953,27 +1327,36 @@ async def submit_tasks_for_pending_queries(
     for i in range(0, total_pending, TASK_POST_BATCH_SIZE):
         batch = pending[i: i + TASK_POST_BATCH_SIZE]
         post_data = {}
+        batch_items = []
 
         for _, (query_id, keyword, q_lang, q_loc, q_domain, q_device) in enumerate(batch):
+            valid, reason = validate_keyword(keyword, max_keyword_chars, max_keyword_words)
+            if not valid:
+                await log_reject(conn, keyword, reason or "invalid", "submit:serp")
+                await conn.execute(
+                    "UPDATE queries SET is_valid = 0, invalid_reason = ? WHERE id = ?",
+                    (reason, query_id),
+                )
+                continue
+
             # fall back to global config if per-query value is missing
             lang = q_lang or language_code
             loc = q_loc or location_name
             dom = q_domain or se_domain
-
-            task = {
-                "keyword": keyword,
-                "language_code": lang,
-                "location_name": loc,
-                "se_domain": dom,
-            }
-
-            # optional device
-            if q_device:
-                # assume already validated on import: desktop|mobile
-                task["device"] = q_device
+            task = build_serp_task_payload(
+                keyword,
+                lang,
+                loc,
+                location_code,
+                dom,
+                q_device,
+            )
 
             post_data[len(post_data)] = task
+            batch_items.append((query_id, keyword))
 
+        if not post_data:
+            continue
         await task_post_rate_limiter.wait()
         batch_count += 1
         response = await client.post("/v3/serp/google/organic/task_post", post_data)
@@ -990,7 +1373,7 @@ async def submit_tasks_for_pending_queries(
             print("[SUBMIT] No tasks returned in response", file=sys.stderr)
             continue
 
-        for (query_id, *_rest), task_item in zip(batch, tasks_resp):
+        for (query_id, _keyword), task_item in zip(batch_items, tasks_resp):
             task_id = task_item.get("id")
             status_code = task_item.get("status_code")
             # Check if task creation failed (error status codes >= 40000)
@@ -1016,6 +1399,8 @@ async def submit_sv_tasks_for_pending_queries(
     client: RestClient,
     language_code_default,
     location_name_default,
+    max_keyword_chars,
+    max_keyword_words,
     task_post_rate_limiter: AsyncRateLimiter,
     job_id: int,
 ):
@@ -1044,8 +1429,18 @@ async def submit_sv_tasks_for_pending_queries(
     for i in range(0, total_pending, TASK_POST_BATCH_SIZE):
         batch = pending[i: i + TASK_POST_BATCH_SIZE]
         post_data = {}
+        batch_items = []
 
         for _, (query_id, keyword, q_lang, q_loc) in enumerate(batch):
+            valid, reason = validate_keyword(keyword, max_keyword_chars, max_keyword_words)
+            if not valid:
+                await log_reject(conn, keyword, reason or "invalid", "submit:sv")
+                await conn.execute(
+                    "UPDATE queries SET is_valid = 0, invalid_reason = ? WHERE id = ?",
+                    (reason, query_id),
+                )
+                continue
+
             lang = q_lang or language_code_default
 
             task = {
@@ -1057,7 +1452,10 @@ async def submit_sv_tasks_for_pending_queries(
             # Location filtering is not available for search volume tasks
 
             post_data[len(post_data)] = task
+            batch_items.append((query_id, keyword))
 
+        if not post_data:
+            continue
         await task_post_rate_limiter.wait()
         batch_count += 1
         response = await client.post(
@@ -1076,7 +1474,7 @@ async def submit_sv_tasks_for_pending_queries(
             print("[SV-SUBMIT] No tasks returned in SV response", file=sys.stderr)
             continue
 
-        for (query_id, *_rest), task_item in zip(batch, tasks_resp):
+        for (query_id, _keyword), task_item in zip(batch_items, tasks_resp):
             task_id = task_item.get("id")
             status_code = task_item.get("status_code")
             # Check if task creation failed (error status codes >= 40000)
@@ -1100,6 +1498,101 @@ async def submit_sv_tasks_for_pending_queries(
     return total_submitted
 
 
+# -------- LIVE SERP (REAL-TIME) --------
+
+async def submit_live_serp_for_pending_queries(
+    conn,
+    client: RestClient,
+    language_code,
+    location_name,
+    location_code,
+    se_domain,
+    max_keyword_chars,
+    max_keyword_words,
+    storage_mode,
+    serp_mode,
+    task_post_rate_limiter: AsyncRateLimiter,
+    job_id: int,
+):
+    pending = await get_queries_without_task(conn)
+    total_pending = len(pending)
+    print(f"[LIVE] Queries without tasks: {total_pending}")
+
+    if total_pending == 0:
+        print("[LIVE] Nothing new to submit.")
+        return 0
+
+    if serp_mode == "live-advanced":
+        endpoint = "/v3/serp/google/organic/live/advanced"
+    else:
+        endpoint = "/v3/serp/google/organic/live/regular"
+
+    sem = asyncio.Semaphore(LIVE_POST_CONCURRENCY)
+    total_processed = 0
+
+    async def worker(row):
+        nonlocal total_processed
+        async with sem:
+            query_id, keyword, q_lang, q_loc, q_domain, q_device = row
+            valid, reason = validate_keyword(
+                keyword, max_keyword_chars, max_keyword_words
+            )
+            if not valid:
+                await log_reject(conn, keyword, reason or "invalid", "submit:serp")
+                await conn.execute(
+                    "UPDATE queries SET is_valid = 0, invalid_reason = ? WHERE id = ?",
+                    (reason, query_id),
+                )
+                return
+
+            lang = q_lang or language_code
+            loc = q_loc or location_name
+            dom = q_domain or se_domain
+            task = build_serp_task_payload(
+                keyword,
+                lang,
+                loc,
+                location_code,
+                dom,
+                q_device,
+            )
+            post_data = {0: task}
+
+            await task_post_rate_limiter.wait()
+            resp = await client.post(endpoint, post_data)
+            status_code = resp.get("status_code")
+            status_message = resp.get("status_message")
+            if status_code != 20000:
+                print(
+                    f"[LIVE] Error from live SERP: {status_code} {status_message}",
+                    file=sys.stderr,
+                )
+                return
+
+            tasks_resp = resp.get("tasks", []) or []
+            if not tasks_resp:
+                print("[LIVE] No tasks returned in live response", file=sys.stderr)
+                return
+
+            task_obj = tasks_resp[0]
+            task_id = task_obj.get("id")
+            if not task_id:
+                print("[LIVE] Missing task_id in live response", file=sys.stderr)
+                return
+
+            await mark_task_in_db(conn, query_id, task_id, "created:20000", job_id)
+            filtered = apply_storage_mode(task_obj, storage_mode)
+            raw_json = json.dumps(filtered)
+            await insert_result(conn, task_id, status_code, status_message, raw_json)
+            await mark_task_status(conn, task_id, f"completed:{status_code}")
+            await conn.commit()
+            total_processed += 1
+
+    await asyncio.gather(*(worker(row) for row in pending))
+    print(f"[LIVE] Completed live SERP for {total_processed} query/queries.")
+    return total_processed
+
+
 # -------- REAL SERP FETCH --------
 
 async def _handle_task_get_real(
@@ -1107,6 +1600,7 @@ async def _handle_task_get_real(
     client: RestClient,
     task_id: str,
     task_get_rate_limiter: AsyncRateLimiter,
+    storage_mode: str,
 ):
     """
     Real /task_get handler:
@@ -1154,7 +1648,7 @@ async def _handle_task_get_real(
         )
         return
 
-    task_obj = task_items[0]
+    task_obj = apply_storage_mode(task_items[0], storage_mode)
     raw_json = json.dumps(task_obj)
 
     await insert_result(conn, task_id, status_code, status_message, raw_json)
@@ -1194,6 +1688,7 @@ async def _store_simulated_result(
     local_task_id: str,
     task_obj_template: dict,
     task_get_rate_limiter: AsyncRateLimiter,
+    storage_mode: str,
 ):
     """
     Simulator:
@@ -1214,8 +1709,9 @@ async def _store_simulated_result(
     await task_get_rate_limiter.wait()
 
     # You could customise the task_obj here per keyword if you wanted.
-    # For now, we just store the template as-is.
-    raw_json = json.dumps(task_obj_template)
+    # For now, we just store the template as-is, with storage filtering.
+    filtered = apply_storage_mode(task_obj_template, storage_mode)
+    raw_json = json.dumps(filtered)
     status_code = 20000
     status_message = "OK (simulated)"
 
@@ -1229,6 +1725,7 @@ async def fetch_results_simulator(
     client: RestClient,
     tasks_ready_rate_limiter: AsyncRateLimiter,
     task_get_rate_limiter: AsyncRateLimiter,
+    storage_mode: str,
     base_poll_interval=SIM_BASE_POLL_INTERVAL,
     max_poll_interval=MAX_POLL_INTERVAL,
 ):
@@ -1340,6 +1837,7 @@ async def fetch_results_simulator(
                     local_task_id,
                     sample_task_obj,
                     task_get_rate_limiter,
+                    storage_mode,
                 )
 
         await asyncio.gather(*(worker(tid) for tid in batch_ids))
@@ -1354,6 +1852,7 @@ async def fetch_results_real(
     client: RestClient,
     tasks_ready_rate_limiter: AsyncRateLimiter,
     task_get_rate_limiter: AsyncRateLimiter,
+    storage_mode: str,
     base_poll_interval=REAL_BASE_POLL_INTERVAL,
     max_poll_interval=MAX_POLL_INTERVAL,
 ):
@@ -1528,6 +2027,7 @@ async def fetch_results_real(
                     client,
                     task_id,
                     task_get_rate_limiter,
+                    storage_mode,
                 )
 
         await asyncio.gather(*(worker(tid) for tid in known_ids))
@@ -1764,7 +2264,12 @@ async def fetch_sv_results_real(
 
 # -------- SEARCH VOLUME SIMULATOR --------
 
-async def submit_sv_tasks_simulator(conn, job_id: int):
+async def submit_sv_tasks_simulator(
+    conn,
+    job_id: int,
+    max_keyword_chars,
+    max_keyword_words,
+):
     """
     Simulator: create fake sv_tasks with UUIDs, no external API calls.
     """
@@ -1777,6 +2282,14 @@ async def submit_sv_tasks_simulator(conn, job_id: int):
         return 0
 
     for (query_id, keyword, q_lang, q_loc) in pending:
+        valid, reason = validate_keyword(keyword, max_keyword_chars, max_keyword_words)
+        if not valid:
+            await log_reject(conn, keyword, reason or "invalid", "submit:sv")
+            await conn.execute(
+                "UPDATE queries SET is_valid = 0, invalid_reason = ? WHERE id = ?",
+                (reason, query_id),
+            )
+            continue
         task_id = str(uuid.uuid4())
         status = "created:20000"
         await mark_sv_task_in_db(conn, query_id, task_id, status, job_id)
@@ -1913,20 +2426,47 @@ def load_config(path):
     location_name = config.get(
         "api", "location_name", fallback="New York,New York,United States"
     )
+    location_code_raw = config.get("api", "location_code", fallback="").strip()
+    location_code = int(location_code_raw) if location_code_raw else None
     se_domain = config.get("api", "se_domain", fallback="google.com")
 
     csv_path = config.get("files", "csv_path", fallback="queries.csv")
+    txt_path = config.get("files", "txt_path", fallback=None)
     db_path = config.get("files", "db_path", fallback="serp_tasks.db")
+
+    max_keyword_chars = config.getint(
+        "validation", "max_keyword_chars", fallback=DEFAULT_MAX_KEYWORD_CHARS
+    )
+    max_keyword_words = config.getint(
+        "validation", "max_keyword_words", fallback=DEFAULT_MAX_KEYWORD_WORDS
+    )
+    storage_mode = config.get("storage", "mode", fallback=DEFAULT_STORAGE_MODE).strip().lower()
+    if storage_mode not in ("full", "top10"):
+        print("[CONFIG] storage.mode must be 'full' or 'top10'", file=sys.stderr)
+        sys.exit(1)
+    serp_mode = config.get("serp", "mode", fallback=DEFAULT_SERP_MODE).strip().lower()
+    if serp_mode not in ("tasks", "live-regular", "live-advanced"):
+        print(
+            "[CONFIG] serp.mode must be 'tasks', 'live-regular', or 'live-advanced'",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     return {
         "username": username,
         "password": password,
         "language_code": language_code,
         "location_name": location_name,
+        "location_code": location_code,
         "se_domain": se_domain,
         "csv_path": csv_path,
+        "txt_path": txt_path,
         "db_path": db_path,
         "simulator": simulator,
+        "max_keyword_chars": max_keyword_chars,
+        "max_keyword_words": max_keyword_words,
+        "storage_mode": storage_mode,
+        "serp_mode": serp_mode,
     }
 
 
@@ -1936,10 +2476,29 @@ def load_config(path):
 
 async def main_async(args):
     cfg = load_config(args.config)
+    if cfg.get("txt_path") == "":
+        cfg["txt_path"] = None
     if args.csv:
         cfg["csv_path"] = args.csv
+    if args.txt:
+        cfg["txt_path"] = args.txt
     if args.db:
         cfg["db_path"] = args.db
+    if args.max_keyword_chars is not None:
+        cfg["max_keyword_chars"] = args.max_keyword_chars
+    if args.max_keyword_words is not None:
+        cfg["max_keyword_words"] = args.max_keyword_words
+    if args.storage_mode is not None:
+        cfg["storage_mode"] = args.storage_mode
+    if args.serp_mode is not None:
+        cfg["serp_mode"] = args.serp_mode
+
+    if cfg["storage_mode"] == "top10" and cfg["serp_mode"] == "live-advanced":
+        print(
+            "[CONFIG] storage.mode=top10 cannot be used with serp.mode=live-advanced",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # STATUS MODE: Show queries without tasks (early exit, no API needed)
     if args.mode == "status":
@@ -1955,10 +2514,18 @@ async def main_async(args):
     print("=== DataForSEO Bulk SERP Loader ===")
     print("Using settings:")
     print(f"  CSV           : {cfg['csv_path']}")
+    if cfg.get("txt_path"):
+        print(f"  TXT           : {cfg['txt_path']}")
     print(f"  DB            : {cfg['db_path']}")
     print(f"  language_code : {cfg['language_code']}")
     print(f"  location_name : {cfg['location_name']}")
+    if cfg.get("location_code") is not None:
+        print(f"  location_code : {cfg['location_code']}")
     print(f"  se_domain     : {cfg['se_domain']}")
+    print(f"  max_kw_chars  : {cfg['max_keyword_chars']}")
+    print(f"  max_kw_words  : {cfg['max_keyword_words']}")
+    print(f"  storage_mode  : {cfg['storage_mode']}")
+    print(f"  serp_mode     : {cfg['serp_mode']}")
     print(f"  simulator     : {cfg['simulator']}")
     print(f"  mode          : {args.mode}")
     print(f"  API Endpoint  : https://{domain} {'(SANDBOX)' if cfg['simulator'] else '(PRODUCTION)'}")
@@ -1975,7 +2542,30 @@ async def main_async(args):
 
     # IMPORT
     if args.mode in ("all", "import"):
-        await import_queries_from_csv(conn, cfg["csv_path"], simulator=cfg["simulator"])
+        txt_path = cfg.get("txt_path")
+        allow_missing = bool(txt_path) or cfg["simulator"]
+        if cfg.get("csv_path"):
+            await import_queries_from_csv(
+                conn,
+                cfg["csv_path"],
+                simulator=cfg["simulator"],
+                allow_missing=allow_missing,
+                max_keyword_chars=cfg["max_keyword_chars"],
+                max_keyword_words=cfg["max_keyword_words"],
+            )
+        if txt_path:
+            await import_queries_from_txt(
+                conn,
+                txt_path,
+                simulator=cfg["simulator"],
+                allow_missing=bool(cfg.get("csv_path")) or cfg["simulator"],
+                max_keyword_chars=cfg["max_keyword_chars"],
+                max_keyword_words=cfg["max_keyword_words"],
+            )
+        if cfg["simulator"]:
+            await ensure_min_queries_for_simulator(conn, SIMULATOR_FAKE_QUERY_COUNT)
+        total = await count_queries(conn)
+        print(f"[IMPORT] Total queries in DB: {total}")
     else:
         print("[MAIN] Skipping import step (mode != import/all).")
 
@@ -2001,28 +2591,54 @@ async def main_async(args):
         if args.mode in ("all", "submit"):
             # SERP job
             serp_job_id = await create_job(conn)
-            serp_count = await submit_tasks_for_pending_queries(
-                conn,
-                client,
-                cfg["language_code"],
-                cfg["location_name"],
-                cfg["se_domain"],
-                task_post_rl,
-                serp_job_id,
-            )
+            if cfg["serp_mode"].startswith("live-"):
+                serp_count = await submit_live_serp_for_pending_queries(
+                    conn,
+                    client,
+                    cfg["language_code"],
+                    cfg["location_name"],
+                    cfg["location_code"],
+                    cfg["se_domain"],
+                    cfg["max_keyword_chars"],
+                    cfg["max_keyword_words"],
+                    cfg["storage_mode"],
+                    cfg["serp_mode"],
+                    task_post_rl,
+                    serp_job_id,
+                )
+            else:
+                serp_count = await submit_tasks_for_pending_queries(
+                    conn,
+                    client,
+                    cfg["language_code"],
+                    cfg["location_name"],
+                    cfg["location_code"],
+                    cfg["se_domain"],
+                    cfg["max_keyword_chars"],
+                    cfg["max_keyword_words"],
+                    task_post_rl,
+                    serp_job_id,
+                )
             total_submitted_queries += serp_count or 0
 
             # Search volume jobs
             if args.sv:
                 sv_job_id = await create_job(conn, tag="search-volume")
                 if cfg["simulator"]:
-                    sv_count = await submit_sv_tasks_simulator(conn, sv_job_id)
+                    sv_count = await submit_sv_tasks_simulator(
+                        conn,
+                        sv_job_id,
+                        cfg["max_keyword_chars"],
+                        cfg["max_keyword_words"],
+                    )
                 else:
                     sv_count = await submit_sv_tasks_for_pending_queries(
                         conn,
                         client,
                         cfg["language_code"],
                         cfg["location_name"],
+                        cfg["max_keyword_chars"],
+                        cfg["max_keyword_words"],
                         task_post_rl,
                         sv_job_id,
                     )
@@ -2038,7 +2654,11 @@ async def main_async(args):
         # ----- FETCH PHASE -----
         # If we submitted a small number of queries (< 500), wait 3 minutes before fetching
         # to give the API more time to process them
-        if total_submitted_queries > 0 and total_submitted_queries < 500:
+        if (
+            total_submitted_queries > 0
+            and total_submitted_queries < 500
+            and cfg["serp_mode"] == "tasks"
+        ):
             wait_seconds = 180  # 3 minutes
             print(
                 f"[MAIN] Submitted {total_submitted_queries} query/queries (< 500). "
@@ -2050,12 +2670,15 @@ async def main_async(args):
             # SERP fetch
             if cfg["simulator"]:
                 await fetch_results_simulator(
-                    conn, client, tasks_ready_rl, task_get_rl
+                    conn, client, tasks_ready_rl, task_get_rl, cfg["storage_mode"]
                 )
             else:
-                await fetch_results_real(
-                    conn, client, tasks_ready_rl, task_get_rl
-                )
+                if cfg["serp_mode"].startswith("live-"):
+                    print("[FETCH] Skipping SERP fetch in live mode (results are immediate).")
+                else:
+                    await fetch_results_real(
+                        conn, client, tasks_ready_rl, task_get_rl, cfg["storage_mode"]
+                    )
 
             # Search volume fetch
             if args.sv:
@@ -2073,6 +2696,8 @@ async def main_async(args):
     base_name = os.path.splitext(cfg["db_path"])[0]  # e.g., "serp_tasks" from "serp_tasks.db"
     await export_view_to_csv(conn, "organic_query_ranks", f"{base_name}_organic_ranks.csv")
     await export_view_to_csv(conn, "map_query_ranks", f"{base_name}_map_ranks.csv")
+    await export_view_to_csv(conn, "too_long", f"{base_name}_too_long.csv")
+    await export_serp_items_csv(conn, f"{base_name}_serp_items.csv")
     
     await conn.close()
     print("[MAIN] Done.")
@@ -2092,8 +2717,32 @@ def main():
         help="Optional CSV path override; if not provided, uses [files] csv_path from config.ini",
     )
     parser.add_argument(
+        "--txt",
+        help="Optional TXT path override; if not provided, uses [files] txt_path from config.ini",
+    )
+    parser.add_argument(
         "--db",
         help="Optional SQLite DB path override; if not provided, uses [files] db_path from config.ini",
+    )
+    parser.add_argument(
+        "--max-keyword-chars",
+        type=int,
+        help="Override max keyword length (characters).",
+    )
+    parser.add_argument(
+        "--max-keyword-words",
+        type=int,
+        help="Override max keyword length (words).",
+    )
+    parser.add_argument(
+        "--storage-mode",
+        choices=["full", "top10"],
+        help="Storage mode for SERP items: full or top10.",
+    )
+    parser.add_argument(
+        "--serp-mode",
+        choices=["tasks", "live-regular", "live-advanced"],
+        help="SERP mode: tasks (async), live-regular, or live-advanced.",
     )
     parser.add_argument(
         "--sv",
