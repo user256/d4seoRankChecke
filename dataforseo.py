@@ -816,6 +816,106 @@ async def get_local_pending_task_ids(conn, limit=None):
     return [r[0] for r in rows]
 
 
+async def clear_uncollected_tasks(conn):
+    """
+    Clear all uncollected tasks and their associations from the database.
+    This includes:
+    - Tasks that are not completed (status NOT LIKE 'completed:%')
+    - Their associated results
+    - SV tasks that are not completed
+    - Their associated sv_results
+    """
+    # Count before deletion for reporting
+    async with conn.execute(
+        """
+        SELECT COUNT(*) FROM tasks 
+        WHERE status IS NULL OR status NOT LIKE 'completed:%'
+        """
+    ) as cur:
+        (serp_count,) = await cur.fetchone()
+    
+    async with conn.execute(
+        """
+        SELECT COUNT(*) FROM sv_tasks 
+        WHERE status IS NULL OR status NOT LIKE 'completed:%'
+        """
+    ) as cur:
+        (sv_count,) = await cur.fetchone()
+    
+    # Delete results for uncollected tasks
+    await conn.execute(
+        """
+        DELETE FROM results 
+        WHERE task_id IN (
+            SELECT task_id FROM tasks 
+            WHERE status IS NULL OR status NOT LIKE 'completed:%'
+        )
+        """
+    )
+    
+    # Delete uncollected tasks
+    await conn.execute(
+        """
+        DELETE FROM tasks 
+        WHERE status IS NULL OR status NOT LIKE 'completed:%'
+        """
+    )
+    
+    # Delete sv_results for uncollected sv_tasks
+    await conn.execute(
+        """
+        DELETE FROM sv_results 
+        WHERE task_id IN (
+            SELECT task_id FROM sv_tasks 
+            WHERE status IS NULL OR status NOT LIKE 'completed:%'
+        )
+        """
+    )
+    
+    # Delete uncollected sv_tasks
+    await conn.execute(
+        """
+        DELETE FROM sv_tasks 
+        WHERE status IS NULL OR status NOT LIKE 'completed:%'
+        """
+    )
+    
+    await conn.commit()
+    
+    print(f"[CLEANUP] Cleared {serp_count} uncollected SERP task(s) and {sv_count} uncollected SV task(s) with their associations.")
+
+
+async def show_queries_without_tasks(conn):
+    """
+    Display queries that don't have tasks (SERP or SV) in a readable format.
+    """
+    queries_without_serp = await get_queries_without_task(conn)
+    queries_without_sv = await get_queries_without_sv_task(conn)
+    
+    print("\n=== Queries Without Tasks ===")
+    print(f"\n[SERP] Queries without SERP tasks: {len(queries_without_serp)}")
+    if queries_without_serp:
+        print("\nID  | Keyword")
+        print("-" * 80)
+        for row in queries_without_serp:
+            query_id, keyword = row[0], row[1]
+            print(f"{query_id:4d} | {keyword}")
+    else:
+        print("  (All queries have SERP tasks)")
+    
+    print(f"\n[SV] Queries without Search Volume tasks: {len(queries_without_sv)}")
+    if queries_without_sv:
+        print("\nID  | Keyword")
+        print("-" * 80)
+        for row in queries_without_sv:
+            query_id, keyword = row[0], row[1]
+            print(f"{query_id:4d} | {keyword}")
+    else:
+        print("  (All queries have Search Volume tasks)")
+    
+    print()
+
+
 # ----------------------------
 # API logic (async)
 # ----------------------------
@@ -1313,29 +1413,59 @@ async def fetch_results_real(
             await asyncio.sleep(delay)
             continue
 
+        # DEBUG: Get sample of local pending task IDs for comparison
+        if idle_polls > 0 and poll_num <= 3:
+            sample_pending = await get_local_pending_task_ids(conn, limit=5)
+            print(f"[DEBUG] Sample local pending task IDs: {sample_pending}")
+
         # Split into known vs unknown
-        # Note: /tasks_ready returns wrapper tasks, actual task IDs are in result[0].id
+        # Note: /tasks_ready returns tasks where task IDs can be:
+        #   - At top level: t.get("id")
+        #   - In result array: result_item.get("id") within t.get("result")
         # When no tasks are ready, result can be null instead of []
         known_ids = []
-        unknown_ids = 0
+        unknown_ids = []
+        all_returned_ids = []
         for t in ready_tasks:
-            # Extract actual task IDs from result array (handle null case)
+            # First check top-level ID
+            top_level_id = t.get("id")
+            if top_level_id:
+                all_returned_ids.append(top_level_id)
+                async with conn.execute(
+                    "SELECT 1 FROM tasks WHERE task_id = ?",
+                    (top_level_id,),
+                ) as cur:
+                    row = await cur.fetchone()
+                if row:
+                    known_ids.append(top_level_id)
+                else:
+                    unknown_ids.append(top_level_id)
+            
+            # Also check nested result array (handle null case)
             result_items = t.get("result") or []
-            if not result_items:
-                continue
             for result_item in result_items:
                 task_id = result_item.get("id")
                 if not task_id:
                     continue
-                async with conn.execute(
-                    "SELECT 1 FROM tasks WHERE task_id = ?",
-                    (task_id,),
-                ) as cur:
-                    row = await cur.fetchone()
-                if row:
-                    known_ids.append(task_id)
-                else:
-                    unknown_ids += 1
+                # Avoid duplicates if already found at top level
+                if task_id not in all_returned_ids:
+                    all_returned_ids.append(task_id)
+                    async with conn.execute(
+                        "SELECT 1 FROM tasks WHERE task_id = ?",
+                        (task_id,),
+                    ) as cur:
+                        row = await cur.fetchone()
+                    if row:
+                        known_ids.append(task_id)
+                    else:
+                        unknown_ids.append(task_id)
+
+        # DEBUG: Show what we got vs what we're looking for
+        if idle_polls > 0 and poll_num <= 3:
+            print(f"[DEBUG] /tasks_ready returned {len(all_returned_ids)} task ID(s): {all_returned_ids[:5]}")
+            print(f"[DEBUG] Known: {len(known_ids)}, Unknown: {len(unknown_ids)}")
+            if unknown_ids:
+                print(f"[DEBUG] Unknown task IDs: {unknown_ids[:5]}")
 
         if not known_ids:
             idle_polls += 1
@@ -1377,7 +1507,7 @@ async def fetch_results_real(
             delay = min(base_poll_interval * (2 ** (idle_polls - 1)), max_poll_interval)
             print(
                 f"[FETCH] Poll #{poll_num}: ready={len(ready_tasks)}, known=0, "
-                f"foreign={unknown_ids} (idle={idle_polls}); sleeping {delay:.1f}s."
+                f"foreign={len(unknown_ids)} (idle={idle_polls}); sleeping {delay:.1f}s."
             )
             await asyncio.sleep(delay)
             continue
@@ -1385,7 +1515,7 @@ async def fetch_results_real(
         idle_polls = 0
         print(
             f"[FETCH] Poll #{poll_num}: ready={len(ready_tasks)}, known={len(known_ids)}, "
-            f"foreign={unknown_ids}, pending_before={pending}."
+            f"foreign={len(unknown_ids)}, pending_before={pending}."
         )
 
         # Mark known tasks as ready
@@ -1529,28 +1659,43 @@ async def fetch_sv_results_real(
             continue
 
         # split into known vs unknown
-        # Note: /tasks_ready returns wrapper tasks, actual task IDs are in result[0].id
+        # Note: /tasks_ready returns tasks where task IDs can be:
+        #   - At top level: t.get("id")
+        #   - In result array: result_item.get("id") within t.get("result")
         # When no tasks are ready, result can be null instead of []
         known_ids = []
-        unknown_ids = 0
+        unknown_ids = []
         for t in ready_tasks:
-            # Extract actual task IDs from result array (handle null case)
+            # First check top-level ID
+            top_level_id = t.get("id")
+            if top_level_id:
+                async with conn.execute(
+                    "SELECT 1 FROM sv_tasks WHERE task_id = ?",
+                    (top_level_id,),
+                ) as cur:
+                    row = await cur.fetchone()
+                if row:
+                    known_ids.append(top_level_id)
+                else:
+                    unknown_ids.append(top_level_id)
+            
+            # Also check nested result array (handle null case)
             result_items = t.get("result") or []
-            if not result_items:
-                continue
             for result_item in result_items:
                 t_id = result_item.get("id")
                 if not t_id:
                     continue
-                async with conn.execute(
-                    "SELECT 1 FROM sv_tasks WHERE task_id = ?",
-                    (t_id,),
-                ) as cur:
-                    row = await cur.fetchone()
-                if row:
-                    known_ids.append(t_id)
-                else:
-                    unknown_ids += 1
+                # Avoid duplicates if already found at top level
+                if t_id not in known_ids and t_id not in unknown_ids:
+                    async with conn.execute(
+                        "SELECT 1 FROM sv_tasks WHERE task_id = ?",
+                        (t_id,),
+                    ) as cur:
+                        row = await cur.fetchone()
+                    if row:
+                        known_ids.append(t_id)
+                    else:
+                        unknown_ids.append(t_id)
 
         if not known_ids:
             idle_polls += 1
@@ -1592,7 +1737,7 @@ async def fetch_sv_results_real(
             )
             print(
                 f"[SV-FETCH] Poll #{poll_num}: ready={len(ready_tasks)}, known=0, "
-                f"foreign={unknown_ids} (idle={idle_polls}); sleeping {delay:.1f}s."
+                f"foreign={len(unknown_ids)} (idle={idle_polls}); sleeping {delay:.1f}s."
             )
             await asyncio.sleep(delay)
             continue
@@ -1600,7 +1745,7 @@ async def fetch_sv_results_real(
         idle_polls = 0
         print(
             f"[SV-FETCH] Poll #{poll_num}: ready={len(ready_tasks)}, known={len(known_ids)}, "
-            f"foreign={unknown_ids}, pending_before={pending}."
+            f"foreign={len(unknown_ids)}, pending_before={pending}."
         )
 
         async def worker(tid: str):
@@ -1796,6 +1941,15 @@ async def main_async(args):
     if args.db:
         cfg["db_path"] = args.db
 
+    # STATUS MODE: Show queries without tasks (early exit, no API needed)
+    if args.mode == "status":
+        conn = await init_db(cfg["db_path"])
+        # Don't create/update views for status mode - we only query base tables
+        # This avoids database locking issues
+        await show_queries_without_tasks(conn)
+        await conn.close()
+        return
+    
     domain = "sandbox.dataforseo.com" if cfg["simulator"] else "api.dataforseo.com"
     
     print("=== DataForSEO Bulk SERP Loader ===")
@@ -1815,6 +1969,9 @@ async def main_async(args):
 
     conn = await init_db(cfg["db_path"])
     await create_views(conn)
+    
+    # CLEANUP: Clear uncollected tasks and their associations
+    #await clear_uncollected_tasks(conn)
 
     # IMPORT
     if args.mode in ("all", "import"):
@@ -1946,14 +2103,15 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["all", "import", "submit", "fetch"],
+        choices=["all", "import", "submit", "fetch", "status"],
         default="all",
         help=(
             "Pipeline mode:\n"
-            "  all    = import/top-up queries, submit tasks for queries without tasks, then fetch results\n"
-            "  import = only import/top-up queries\n"
-            "  submit = only submit tasks for queries without tasks (creates a new job)\n"
-            "  fetch  = only fetch results for pending tasks\n"
+            "  all     : Import queries, submit tasks, and fetch results (default)\n"
+            "  import  : Only import queries from CSV\n"
+            "  submit  : Only submit tasks for queries without tasks\n"
+            "  fetch   : Only fetch results for pending tasks\n"
+            "  status  : Show queries without tasks (SERP or SV)"
         ),
     )
 
