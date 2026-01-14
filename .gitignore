@@ -49,6 +49,7 @@ Thumbs.db
 
 # CSV exports
 *.csv
+!queries.csv
 
 # Local scratch
 old/
