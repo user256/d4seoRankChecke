@@ -8,7 +8,7 @@ A Python tool for bulk fetching Search Engine Results Page (SERP) data and searc
 - **Search Volume Data**: Fetch search volume metrics for keywords
 - **Async Processing**: Efficient concurrent API calls with rate limiting
 - **SQLite Storage**: Local database for storing queries, tasks, and results
-- **Keyword Validation**: Enforces max keyword length/word limits before submission
+- **Keyword Validation**: Enforces max keyword length/word limits and character rules before submission
 - **Simulator Mode**: Test the tool using DataForSEO's sandbox environment
 - **Flexible Configuration**: Per-query overrides for language, location, search engine domain, and device
 
@@ -124,14 +124,17 @@ python3 dataforseo.py --mode fetch
 - `--max-keyword-words N`: Override max keyword length (words)
 - `--storage-mode {full|top10}`: Store full results or only top 10 organic
 - `--serp-mode {tasks|live-regular|live-advanced}`: Choose SERP task vs live endpoint
+- `--export-mode {fast|full}`: Fast exports views only; full also exports SERP items
+- `--export-progress`: Show progress output during exports
 
 Note: `storage.mode=top10` cannot be used with `serp.mode=live-advanced`.
+Note: keywords are validated to satisfy both SERP and Google Ads Keywords Data rules (ASCII only, max 80 chars/10 words, no SERP operators like `site:` or `cache:`).
 
 Exports:
 - `<db>_organic_ranks.csv`: flattened organic ranks view
 - `<db>_map_ranks.csv`: local pack/map items view
 - `<db>_too_long.csv`: rejected keywords (length/word limits)
-- `<db>_serp_items.csv`: flattened SERP items (including nested items like People Also Ask).
+- `<db>_serp_items.csv`: flattened SERP items (including nested items like People Also Ask) when using `--export-mode full`.
 
 By default, the tool uses the SQLite database path defined in
 config.ini. Use the `--db` flag to point to a different SQLite file. If the file does

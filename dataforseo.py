@@ -8,6 +8,7 @@ from base64 import b64encode
 import sqlite3  # only for catching OperationalError if needed
 import uuid     # for simulated sv task IDs
 from typing import Optional, Tuple
+import re
 
 # ----------------------------
 # Config / constants
@@ -30,6 +31,7 @@ MAX_TASK_GET_CALLS_PER_MINUTE = 2000      # /task_get/{id}
 
 TASK_POST_BATCH_SIZE = 100                # max tasks per POST (API limit)
 TASKS_READY_MAX_PER_CALL = 1000           # max tasks returned per /tasks_ready call (informational)
+SV_KEYWORDS_PER_TASK = 1000               # max keywords per SV task
 
 TASK_GET_CONCURRENCY = 25                 # how many /task_get calls to run concurrently
 
@@ -281,6 +283,28 @@ async def init_db(db_path):
         """
     )
 
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sv_task_queries (
+            task_id TEXT NOT NULL,
+            query_id INTEGER NOT NULL,
+            PRIMARY KEY (task_id, query_id),
+            FOREIGN KEY(task_id) REFERENCES sv_tasks(task_id),
+            FOREIGN KEY(query_id) REFERENCES queries(id)
+        )
+        """
+    )
+
+    # Backfill sv_task_queries for existing SV tasks (one-to-one legacy)
+    await conn.execute(
+        """
+        INSERT OR IGNORE INTO sv_task_queries (task_id, query_id)
+        SELECT task_id, query_id
+        FROM sv_tasks
+        WHERE query_id IS NOT NULL
+        """
+    )
+
     await conn.commit()
     return conn
 
@@ -298,6 +322,19 @@ def validate_keyword(
         return False, f"length>{max_chars}"
     if max_words and _count_words(keyword) > max_words:
         return False, f"words>{max_words}"
+    if not keyword.isascii():
+        return False, "non_ascii"
+    if re.search(r"[^a-zA-Z0-9 '\\-]", keyword):
+        return False, "illegal_chars"
+    lower = keyword.lower()
+    if "cache:" in lower:
+        return False, "serp_cache"
+    if re.search(
+        r"(^|\\s)(allinanchor:|allintext:|allintitle:|allinurl:|define:|filetype:|id:|"
+        r"inanchor:|info:|intext:|intitle:|inurl:|link:|site:)(\\S*)",
+        lower,
+    ):
+        return False, "serp_operator"
     return True, None
 
 
@@ -347,6 +384,15 @@ def apply_storage_mode(task_obj: dict, storage_mode: str) -> dict:
     return task_copy
 
 
+def extract_invalid_keyword(status_message: str) -> Optional[str]:
+    if not status_message:
+        return None
+    match = re.search(r"symbols: '(.+)'", status_message)
+    if match:
+        return match.group(1)
+    return None
+
+
 def build_serp_task_payload(
     keyword: str,
     language_code: Optional[str],
@@ -381,21 +427,25 @@ async def export_view_to_csv(conn, view_name: str, csv_path: str):
     """
     try:
         async with conn.execute(f"SELECT * FROM {view_name}") as cur:
-            rows = await cur.fetchall()
-            if not rows:
+            column_names = [description[0] for description in cur.description]
+            if not column_names:
                 print(f"[EXPORT] View '{view_name}' is empty; skipping CSV export.")
                 return
-            
-            # Get column names
-            column_names = [description[0] for description in cur.description]
-            
-            # Write to CSV
+
+            row_count = 0
             with open(csv_path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 writer.writerow(column_names)
-                writer.writerows(rows)
-            
-            print(f"[EXPORT] Exported {len(rows)} rows from '{view_name}' to '{csv_path}'")
+                while True:
+                    rows = await cur.fetchmany(5000)
+                    if not rows:
+                        break
+                    writer.writerows(rows)
+                    row_count += len(rows)
+            if row_count == 0:
+                print(f"[EXPORT] View '{view_name}' is empty; skipping CSV export.")
+                return
+            print(f"[EXPORT] Exported {row_count} rows from '{view_name}' to '{csv_path}'")
     except Exception as e:
         print(f"[EXPORT] Error exporting '{view_name}' to '{csv_path}': {e}", file=sys.stderr)
 
@@ -408,7 +458,7 @@ def _first_dict(value):
     return None
 
 
-async def export_serp_items_csv(conn, csv_path: str):
+async def export_serp_items_csv(conn, csv_path: str, progress=False):
     """
     Export flattened SERP items (including nested items) to a CSV.
     """
@@ -423,82 +473,6 @@ async def export_serp_items_csv(conn, csv_path: str):
             GROUP BY task_id
         ) latest ON latest.task_id = r.task_id AND latest.max_created_at = r.created_at
     """
-    rows_out = []
-    async with conn.execute(sql) as cur:
-        rows = await cur.fetchall()
-        for keyword, task_id, result_json in rows:
-            if not result_json:
-                continue
-            try:
-                task_obj = json.loads(result_json)
-            except json.JSONDecodeError:
-                continue
-            results = task_obj.get("result") or []
-            if not results:
-                continue
-            items = results[0].get("items") or []
-            for item in items:
-                parent_type = item.get("type")
-                parent_rank_group = item.get("rank_group")
-                parent_rank_absolute = item.get("rank_absolute")
-                children = item.get("items")
-                if isinstance(children, list) and children:
-                    for child in children:
-                        if not isinstance(child, dict):
-                            continue
-                        expanded = None
-                        if parent_type == "people_also_ask":
-                            expanded = _first_dict(child.get("expanded_element"))
-                        row = {
-                            "keyword": keyword,
-                            "task_id": task_id,
-                            "parent_type": parent_type,
-                            "parent_rank_group": parent_rank_group,
-                            "parent_rank_absolute": parent_rank_absolute,
-                            "item_type": child.get("type"),
-                            "rank_group": child.get("rank_group"),
-                            "rank_absolute": child.get("rank_absolute"),
-                            "page": child.get("page"),
-                            "position": child.get("position"),
-                            "title": child.get("title"),
-                            "url": child.get("url"),
-                            "domain": child.get("domain"),
-                            "source": child.get("source"),
-                            "description": child.get("description"),
-                            "expanded_title": expanded.get("title") if expanded else None,
-                            "expanded_url": expanded.get("url") if expanded else None,
-                            "expanded_domain": expanded.get("domain") if expanded else None,
-                            "expanded_description": expanded.get("description") if expanded else None,
-                        }
-                        rows_out.append(row)
-                else:
-                    row = {
-                        "keyword": keyword,
-                        "task_id": task_id,
-                        "parent_type": None,
-                        "parent_rank_group": None,
-                        "parent_rank_absolute": None,
-                        "item_type": parent_type,
-                        "rank_group": item.get("rank_group"),
-                        "rank_absolute": item.get("rank_absolute"),
-                        "page": item.get("page"),
-                        "position": item.get("position"),
-                        "title": item.get("title"),
-                        "url": item.get("url"),
-                        "domain": item.get("domain"),
-                        "source": item.get("source"),
-                        "description": item.get("description"),
-                        "expanded_title": None,
-                        "expanded_url": None,
-                        "expanded_domain": None,
-                        "expanded_description": None,
-                    }
-                    rows_out.append(row)
-
-    if not rows_out:
-        print(f"[EXPORT] SERP items export is empty; skipping CSV export.")
-        return
-
     fieldnames = [
         "keyword",
         "task_id",
@@ -520,14 +494,99 @@ async def export_serp_items_csv(conn, csv_path: str):
         "expanded_domain",
         "expanded_description",
     ]
-    try:
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows_out)
-        print(f"[EXPORT] Exported {len(rows_out)} rows to '{csv_path}'")
-    except Exception as e:
-        print(f"[EXPORT] Error exporting SERP items to '{csv_path}': {e}", file=sys.stderr)
+
+    row_count = 0
+    task_count = 0
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        async with conn.execute(sql) as cur:
+            while True:
+                rows = await cur.fetchmany(1000)
+                if not rows:
+                    break
+                for keyword, task_id, result_json in rows:
+                    task_count += 1
+                    if progress and task_count % 50 == 0:
+                        print(f"[EXPORT] SERP items processed tasks: {task_count}")
+                    if not result_json:
+                        continue
+                    try:
+                        task_obj = json.loads(result_json)
+                    except json.JSONDecodeError:
+                        continue
+                    results = task_obj.get("result") or []
+                    if not results:
+                        continue
+                    items = results[0].get("items") or []
+                    for item in items:
+                        parent_type = item.get("type")
+                        parent_rank_group = item.get("rank_group")
+                        parent_rank_absolute = item.get("rank_absolute")
+                        children = item.get("items")
+                        if isinstance(children, list) and children:
+                            for child in children:
+                                if not isinstance(child, dict):
+                                    continue
+                                expanded = None
+                                if parent_type == "people_also_ask":
+                                    expanded = _first_dict(child.get("expanded_element"))
+                                row = {
+                                    "keyword": keyword,
+                                    "task_id": task_id,
+                                    "parent_type": parent_type,
+                                    "parent_rank_group": parent_rank_group,
+                                    "parent_rank_absolute": parent_rank_absolute,
+                                    "item_type": child.get("type"),
+                                    "rank_group": child.get("rank_group"),
+                                    "rank_absolute": child.get("rank_absolute"),
+                                    "page": child.get("page"),
+                                    "position": child.get("position"),
+                                    "title": child.get("title"),
+                                    "url": child.get("url"),
+                                    "domain": child.get("domain"),
+                                    "source": child.get("source"),
+                                    "description": child.get("description"),
+                                    "expanded_title": expanded.get("title") if expanded else None,
+                                    "expanded_url": expanded.get("url") if expanded else None,
+                                    "expanded_domain": expanded.get("domain") if expanded else None,
+                                    "expanded_description": expanded.get("description") if expanded else None,
+                                }
+                                writer.writerow(row)
+                                row_count += 1
+                        else:
+                            row = {
+                                "keyword": keyword,
+                                "task_id": task_id,
+                                "parent_type": None,
+                                "parent_rank_group": None,
+                                "parent_rank_absolute": None,
+                                "item_type": parent_type,
+                                "rank_group": item.get("rank_group"),
+                                "rank_absolute": item.get("rank_absolute"),
+                                "page": item.get("page"),
+                                "position": item.get("position"),
+                                "title": item.get("title"),
+                                "url": item.get("url"),
+                                "domain": item.get("domain"),
+                                "source": item.get("source"),
+                                "description": item.get("description"),
+                                "expanded_title": None,
+                                "expanded_url": None,
+                                "expanded_domain": None,
+                                "expanded_description": None,
+                            }
+                            writer.writerow(row)
+                            row_count += 1
+
+    if row_count == 0:
+        try:
+            os.remove(csv_path)
+        except Exception:
+            pass
+        print(f"[EXPORT] SERP items export is empty; skipping CSV export.")
+        return
+    print(f"[EXPORT] Exported {row_count} rows to '{csv_path}'")
 
 async def create_views(conn):
     """
@@ -576,11 +635,10 @@ async def create_views(conn):
     ),
     sv_data AS (
         SELECT
-            q.keyword AS query_keyword,
-            json_extract(svr.result_json, '$.result[0].search_volume') AS search_volume
+            json_extract(je.value, '$.keyword') AS query_keyword,
+            json_extract(je.value, '$.search_volume') AS search_volume
         FROM sv_results svr
-        JOIN sv_tasks svt ON svt.task_id = svr.task_id
-        JOIN queries q ON q.id = svt.query_id
+        JOIN json_each(svr.result_json, '$.result') AS je
         WHERE svr.result_json IS NOT NULL
     )
     SELECT DISTINCT
@@ -647,11 +705,10 @@ async def create_views(conn):
     ),
     sv_data AS (
         SELECT
-            q.keyword AS query_keyword,
-            json_extract(svr.result_json, '$.result[0].search_volume') AS search_volume
+            json_extract(je.value, '$.keyword') AS query_keyword,
+            json_extract(je.value, '$.search_volume') AS search_volume
         FROM sv_results svr
-        JOIN sv_tasks svt ON svt.task_id = svr.task_id
-        JOIN queries q ON q.id = svt.query_id
+        JOIN json_each(svr.result_json, '$.result') AS je
         WHERE svr.result_json IS NOT NULL
     )
     SELECT DISTINCT
@@ -737,6 +794,27 @@ async def count_queries(conn) -> int:
     async with conn.execute("SELECT COUNT(*) FROM queries") as cur:
         (cnt,) = await cur.fetchone()
     return cnt
+
+
+def estimate_sv_task_count(pending_rows, language_code_default):
+    by_lang = {}
+    for (_qid, _kw, q_lang, _q_loc) in pending_rows:
+        lang = q_lang or language_code_default
+        by_lang.setdefault(lang, 0)
+        by_lang[lang] += 1
+    task_count = 0
+    for count in by_lang.values():
+        task_count += (count + SV_KEYWORDS_PER_TASK - 1) // SV_KEYWORDS_PER_TASK
+    return task_count
+
+
+async def estimate_billable_counts(conn, include_sv: bool, language_code_default: str):
+    serp_pending = await get_queries_without_task(conn)
+    sv_pending = []
+    if include_sv:
+        sv_pending = await get_queries_without_sv_result(conn)
+    sv_tasks_estimate = estimate_sv_task_count(sv_pending, language_code_default)
+    return len(serp_pending), len(sv_pending), sv_tasks_estimate
 
 
 async def import_queries_from_csv(
@@ -981,9 +1059,9 @@ async def get_queries_without_task(conn):
     return rows
 
 
-async def get_queries_without_sv_task(conn):
+async def get_queries_without_sv_result(conn):
     """
-    Return queries that don't yet have a search volume task.
+    Return queries that don't yet have a search volume result.
     """
     sql = """
         SELECT
@@ -992,8 +1070,13 @@ async def get_queries_without_sv_task(conn):
             q.language_code,
             q.location_name
         FROM queries q
-        LEFT JOIN sv_tasks t ON t.query_id = q.id
-        WHERE t.id IS NULL
+        LEFT JOIN (
+            SELECT DISTINCT json_extract(je.value, '$.keyword') AS keyword
+            FROM sv_results svr
+            JOIN json_each(svr.result_json, '$.result') AS je
+            WHERE svr.result_json IS NOT NULL
+        ) svk ON svk.keyword = q.keyword
+        WHERE svk.keyword IS NULL
         AND COALESCE(q.is_valid, 1) = 1
     """
     async with conn.execute(sql) as cur:
@@ -1009,6 +1092,18 @@ async def mark_sv_task_in_db(conn, query_id, task_id, status, job_id):
         VALUES (?, ?, ?, ?, ?, ?)
         """,
         (query_id, task_id, status, now, now, job_id),
+    )
+
+
+async def mark_sv_task_queries(conn, task_id, query_ids):
+    if not query_ids:
+        return
+    await conn.executemany(
+        """
+        INSERT OR IGNORE INTO sv_task_queries (task_id, query_id)
+        VALUES (?, ?)
+        """,
+        [(task_id, qid) for qid in query_ids],
     )
 
 
@@ -1258,10 +1353,10 @@ async def clear_uncollected_tasks(conn):
 
 async def show_queries_without_tasks(conn):
     """
-    Display queries that don't have tasks (SERP or SV) in a readable format.
+    Display queries that don't have tasks (SERP) or missing SV results.
     """
     queries_without_serp = await get_queries_without_task(conn)
-    queries_without_sv = await get_queries_without_sv_task(conn)
+    queries_without_sv = await get_queries_without_sv_result(conn)
     
     print("\n=== Queries Without Tasks ===")
     print(f"\n[SERP] Queries without SERP tasks: {len(queries_without_serp)}")
@@ -1274,7 +1369,7 @@ async def show_queries_without_tasks(conn):
     else:
         print("  (All queries have SERP tasks)")
     
-    print(f"\n[SV] Queries without Search Volume tasks: {len(queries_without_sv)}")
+    print(f"\n[SV] Queries missing Search Volume results: {len(queries_without_sv)}")
     if queries_without_sv:
         print("\nID  | Keyword")
         print("-" * 80)
@@ -1282,7 +1377,7 @@ async def show_queries_without_tasks(conn):
             query_id, keyword = row[0], row[1]
             print(f"{query_id:4d} | {keyword}")
     else:
-        print("  (All queries have Search Volume tasks)")
+        print("  (All queries have Search Volume results)")
     
     print()
 
@@ -1415,47 +1510,61 @@ async def submit_sv_tasks_for_pending_queries(
     Endpoint:
       POST /v3/keywords_data/google_ads/search_volume/task_post
     """
-    pending = await get_queries_without_sv_task(conn)
+    pending = await get_queries_without_sv_result(conn)
     total_pending = len(pending)
-    print(f"[SV-SUBMIT] Queries without search volume tasks: {total_pending}")
+    print(f"[SV-SUBMIT] Queries missing search volume results: {total_pending}")
 
     if total_pending == 0:
         print("[SV-SUBMIT] Nothing new to submit.")
         return 0
 
-    total_submitted = 0
-    batch_count = 0
+    # Group by language_code to avoid mixing languages in a single task
+    by_lang = {}
+    for (query_id, keyword, q_lang, q_loc) in pending:
+        valid, reason = validate_keyword(keyword, max_keyword_chars, max_keyword_words)
+        if not valid:
+            await log_reject(conn, keyword, reason or "invalid", "submit:sv")
+            await conn.execute(
+                "UPDATE queries SET is_valid = 0, invalid_reason = ? WHERE id = ?",
+                (reason, query_id),
+            )
+            continue
+        lang = q_lang or language_code_default
+        by_lang.setdefault(lang, []).append((query_id, keyword))
 
-    for i in range(0, total_pending, TASK_POST_BATCH_SIZE):
-        batch = pending[i: i + TASK_POST_BATCH_SIZE]
-        post_data = {}
-        batch_items = []
-
-        for _, (query_id, keyword, q_lang, q_loc) in enumerate(batch):
-            valid, reason = validate_keyword(keyword, max_keyword_chars, max_keyword_words)
-            if not valid:
-                await log_reject(conn, keyword, reason or "invalid", "submit:sv")
-                await conn.execute(
-                    "UPDATE queries SET is_valid = 0, invalid_reason = ? WHERE id = ?",
-                    (reason, query_id),
-                )
-                continue
-
-            lang = q_lang or language_code_default
-
+    tasks = []
+    for lang, items in by_lang.items():
+        for i in range(0, len(items), SV_KEYWORDS_PER_TASK):
+            chunk = items[i : i + SV_KEYWORDS_PER_TASK]
             task = {
-                "keywords": [keyword],
+                "keywords": [kw for (_, kw) in chunk],
             }
             if lang:
                 task["language_code"] = lang
-            # Note: Search volume API does not accept location_name parameter
-            # Location filtering is not available for search volume tasks
+            tasks.append((task, [qid for (qid, _) in chunk]))
 
-            post_data[len(post_data)] = task
-            batch_items.append((query_id, keyword))
+    if not tasks:
+        print("[SV-SUBMIT] Nothing valid to submit.")
+        return 0
+    keyword_count = sum(len(task["keywords"]) for (task, _qids) in tasks)
+    print(
+        f"[SV-SUBMIT] Prepared {len(tasks)} task(s) for {keyword_count} keyword(s)."
+    )
 
-        if not post_data:
-            continue
+    total_submitted = 0
+    batch_count = 0
+
+    async def submit_task_batch(task_batch):
+        nonlocal total_submitted, batch_count
+        post_data = {}
+        batch_query_ids = []
+        batch_tasks = []
+
+        for task_idx, (task, query_ids) in enumerate(task_batch):
+            post_data[task_idx] = task
+            batch_query_ids.append(query_ids)
+            batch_tasks.append(task)
+
         await task_post_rate_limiter.wait()
         batch_count += 1
         response = await client.post(
@@ -1467,30 +1576,65 @@ async def submit_sv_tasks_for_pending_queries(
                 f"[SV-SUBMIT] Error from SV task_post: {response.get('status_code')} {response.get('status_message')}",
                 file=sys.stderr,
             )
-            continue
+            return []
 
         tasks_resp = response.get("tasks", []) or []
         if not tasks_resp:
             print("[SV-SUBMIT] No tasks returned in SV response", file=sys.stderr)
-            continue
+            return []
 
-        for (query_id, _keyword), task_item in zip(batch_items, tasks_resp):
+        retry_tasks = []
+        for task, query_ids, task_item in zip(batch_tasks, batch_query_ids, tasks_resp):
+            keywords = task["keywords"]
             task_id = task_item.get("id")
             status_code = task_item.get("status_code")
-            # Check if task creation failed (error status codes >= 40000)
+            status_message = task_item.get("status_message", "")
             if status_code and status_code >= 40000:
-                status = f"failed:{status_code}"
-                print(
-                    f"[SV-SUBMIT] SV task creation failed for query_id={query_id}: "
-                    f"{status_code} - {task_item.get('status_message', 'Unknown error')}",
-                    file=sys.stderr,
-                )
-            else:
-                status = f"created:{status_code}"
-            await mark_sv_task_in_db(conn, query_id, task_id, status, job_id)
+                bad_kw = extract_invalid_keyword(status_message or "")
+                if bad_kw and bad_kw in keywords:
+                    await log_reject(conn, bad_kw, "invalid_symbols", "submit:sv")
+                    await conn.execute(
+                        "UPDATE queries SET is_valid = 0, invalid_reason = ? WHERE keyword = ?",
+                        ("invalid_symbols", bad_kw),
+                    )
+                    bad_idx = keywords.index(bad_kw)
+                    keywords.pop(bad_idx)
+                    query_ids.pop(bad_idx)
+                    if keywords:
+                        retry_tasks.append((task, query_ids))
+                    print(
+                        f"[SV-SUBMIT] SV task failed due to invalid keyword; removed '{bad_kw}' and will retry.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"[SV-SUBMIT] SV task creation failed: "
+                        f"{status_code} - {status_message}",
+                        file=sys.stderr,
+                    )
+                continue
+
+            status = f"created:{status_code}"
+            representative_query_id = query_ids[0]
+            await mark_sv_task_in_db(conn, representative_query_id, task_id, status, job_id)
+            await mark_sv_task_queries(conn, task_id, query_ids)
             total_submitted += 1
 
         await conn.commit()
+        return retry_tasks
+
+    pending_tasks = tasks
+    max_retries = 3
+    for attempt in range(max_retries):
+        if not pending_tasks:
+            break
+        retry_tasks = []
+        for i in range(0, len(pending_tasks), TASK_POST_BATCH_SIZE):
+            task_batch = pending_tasks[i : i + TASK_POST_BATCH_SIZE]
+            retry_tasks.extend(await submit_task_batch(task_batch))
+        pending_tasks = retry_tasks
+        if pending_tasks:
+            print(f"[SV-SUBMIT] Retrying {len(pending_tasks)} task(s) (attempt {attempt + 2}/{max_retries})...")
 
     print(
         f"[SV-SUBMIT] Submitted {total_submitted} search volume task(s) in {batch_count} batch(es) for job {job_id}."
@@ -2273,14 +2417,15 @@ async def submit_sv_tasks_simulator(
     """
     Simulator: create fake sv_tasks with UUIDs, no external API calls.
     """
-    pending = await get_queries_without_sv_task(conn)
+    pending = await get_queries_without_sv_result(conn)
     total_pending = len(pending)
-    print(f"[SV-SIM-SUBMIT] Queries without SV tasks: {total_pending}")
+    print(f"[SV-SIM-SUBMIT] Queries missing SV results: {total_pending}")
 
     if total_pending == 0:
         print("[SV-SIM-SUBMIT] Nothing new to submit.")
         return 0
 
+    by_lang = {}
     for (query_id, keyword, q_lang, q_loc) in pending:
         valid, reason = validate_keyword(keyword, max_keyword_chars, max_keyword_words)
         if not valid:
@@ -2290,13 +2435,21 @@ async def submit_sv_tasks_simulator(
                 (reason, query_id),
             )
             continue
-        task_id = str(uuid.uuid4())
-        status = "created:20000"
-        await mark_sv_task_in_db(conn, query_id, task_id, status, job_id)
+        by_lang.setdefault(q_lang, []).append((query_id, keyword))
+
+    for _lang, items in by_lang.items():
+        for i in range(0, len(items), SV_KEYWORDS_PER_TASK):
+            chunk = items[i : i + SV_KEYWORDS_PER_TASK]
+            query_ids = [qid for (qid, _kw) in chunk]
+            task_id = str(uuid.uuid4())
+            status = "created:20000"
+            await mark_sv_task_in_db(conn, query_ids[0], task_id, status, job_id)
+            await mark_sv_task_queries(conn, task_id, query_ids)
 
     await conn.commit()
-    print(f"[SV-SIM-SUBMIT] Created {total_pending} simulated SV task(s).")
-    return total_pending
+    task_count = await count_local_sv_pending_tasks(conn)
+    print(f"[SV-SIM-SUBMIT] Created {task_count} simulated SV task(s).")
+    return task_count
 
 
 async def _store_sv_simulated_result(
@@ -2307,35 +2460,43 @@ async def _store_sv_simulated_result(
     """
     Simulator: generate a fake but realistic search volume result for one SV task.
     """
-    # Join sv_tasks -> queries to get keyword etc.
+    # Join sv_task_queries -> queries to get keywords for this task
     async with conn.execute(
         """
         SELECT q.keyword, q.language_code, q.location_name
-        FROM sv_tasks s
-        JOIN queries q ON q.id = s.query_id
-        WHERE s.task_id = ?
+        FROM sv_task_queries tq
+        JOIN queries q ON q.id = tq.query_id
+        WHERE tq.task_id = ?
         """,
         (task_id,),
     ) as cur:
-        row = await cur.fetchone()
+        rows = await cur.fetchall()
 
-    if row is None:
+    if not rows:
         return
 
-    keyword, language_code, location_name = row
+    keywords = [r[0] for r in rows]
+    language_code = rows[0][1]
+    location_name = rows[0][2]
 
     await task_get_rate_limiter.wait()
 
-    # Generate some plausible random numbers for simulation
-    base_sv = random.randint(10, 100000)
-    monthly = []
-    # 12 fake months
-    for m in range(12):
-        # fluctuate around base_sv
-        val = max(0, int(base_sv * (0.6 + 0.4 * random.random())))
-        # Just generate dummy month strings; exact dates don't matter for sim
-        month_str = f"2023-{(m % 12) + 1:02d}-01"
-        monthly.append({"month": month_str, "search_volume": val})
+    results = []
+    for keyword in keywords:
+        base_sv = random.randint(10, 100000)
+        monthly = []
+        for m in range(12):
+            val = max(0, int(base_sv * (0.6 + 0.4 * random.random())))
+            month_str = f"2023-{(m % 12) + 1:02d}-01"
+            monthly.append({"month": month_str, "search_volume": val})
+        results.append(
+            {
+                "keyword": keyword,
+                "search_volume": base_sv,
+                "competition_index": round(random.random(), 2),
+                "monthly_searches": monthly,
+            }
+        )
 
     task_obj = {
         "id": task_id,
@@ -2353,18 +2514,11 @@ async def _store_sv_simulated_result(
             task_id,
         ],
         "data": {
-            "keywords": [keyword],
+            "keywords": keywords,
             "language_code": language_code,
             "location_name": location_name,
         },
-        "result": [
-            {
-                "keyword": keyword,
-                "search_volume": base_sv,
-                "competition_index": round(random.random(), 2),
-                "monthly_searches": monthly,
-            }
-        ],
+        "result": results,
     }
 
     raw_json = json.dumps(task_obj)
@@ -2569,6 +2723,23 @@ async def main_async(args):
     else:
         print("[MAIN] Skipping import step (mode != import/all).")
 
+    # COST ESTIMATE (before submit)
+    if args.mode in ("all", "submit"):
+        serp_count, sv_count, sv_task_estimate = await estimate_billable_counts(
+            conn, args.sv, cfg["language_code"]
+        )
+        if cfg["serp_mode"].startswith("live-"):
+            print(f"[ESTIMATE] SERP live requests pending: {serp_count}")
+        else:
+            print(f"[ESTIMATE] SERP tasks pending: {serp_count}")
+        if args.sv:
+            print(
+                f"[ESTIMATE] Search volume keywords pending: {sv_count} "
+                f"(estimated tasks: {sv_task_estimate})"
+            )
+        if cfg["simulator"]:
+            print("[ESTIMATE] Simulator mode is enabled; no API charges will apply.")
+
     if args.mode == "import":
         await conn.close()
         print("[MAIN] Done (import only).")
@@ -2587,7 +2758,8 @@ async def main_async(args):
         )
 
         # ----- SUBMIT PHASE -----
-        total_submitted_queries = 0
+        serp_submitted = 0
+        sv_submitted_tasks = 0
         if args.mode in ("all", "submit"):
             # SERP job
             serp_job_id = await create_job(conn)
@@ -2619,7 +2791,7 @@ async def main_async(args):
                     task_post_rl,
                     serp_job_id,
                 )
-            total_submitted_queries += serp_count or 0
+            serp_submitted = serp_count or 0
 
             # Search volume jobs
             if args.sv:
@@ -2642,7 +2814,7 @@ async def main_async(args):
                         task_post_rl,
                         sv_job_id,
                     )
-                total_submitted_queries += sv_count or 0
+                sv_submitted_tasks = sv_count or 0
         else:
             print("[MAIN] Skipping submit step (mode != submit/all).")
 
@@ -2654,14 +2826,10 @@ async def main_async(args):
         # ----- FETCH PHASE -----
         # If we submitted a small number of queries (< 500), wait 3 minutes before fetching
         # to give the API more time to process them
-        if (
-            total_submitted_queries > 0
-            and total_submitted_queries < 500
-            and cfg["serp_mode"] == "tasks"
-        ):
+        if serp_submitted > 0 and serp_submitted < 500 and cfg["serp_mode"] == "tasks":
             wait_seconds = 180  # 3 minutes
             print(
-                f"[MAIN] Submitted {total_submitted_queries} query/queries (< 500). "
+                f"[MAIN] Submitted {serp_submitted} query/queries (< 500). "
                 f"Waiting {wait_seconds} seconds before starting fetch to allow API processing time..."
             )
             await asyncio.sleep(wait_seconds)
@@ -2697,7 +2865,10 @@ async def main_async(args):
     await export_view_to_csv(conn, "organic_query_ranks", f"{base_name}_organic_ranks.csv")
     await export_view_to_csv(conn, "map_query_ranks", f"{base_name}_map_ranks.csv")
     await export_view_to_csv(conn, "too_long", f"{base_name}_too_long.csv")
-    await export_serp_items_csv(conn, f"{base_name}_serp_items.csv")
+    if args.export_mode == "full":
+        await export_serp_items_csv(
+            conn, f"{base_name}_serp_items.csv", progress=args.export_progress
+        )
     
     await conn.close()
     print("[MAIN] Done.")
@@ -2743,6 +2914,17 @@ def main():
         "--serp-mode",
         choices=["tasks", "live-regular", "live-advanced"],
         help="SERP mode: tasks (async), live-regular, or live-advanced.",
+    )
+    parser.add_argument(
+        "--export-mode",
+        choices=["fast", "full"],
+        default="fast",
+        help="Export mode: fast (views only) or full (include serp_items export).",
+    )
+    parser.add_argument(
+        "--export-progress",
+        action="store_true",
+        help="Show progress output during exports.",
     )
     parser.add_argument(
         "--sv",
